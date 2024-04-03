@@ -233,39 +233,61 @@ class MetaPruner:
         #     if str(layer_index) in pr_weight:
         #         pr = pr_weight[str(layer_index)] * pr
         return pr
-    
+        
     def get_pr(self):
+        # 判断所使用的架构是否为单分支架构（如VGG），如果是，则使用针对VGG的剪枝方法。
         if self.is_single_branch(self.args.arch):
             get_layer_pr = self._get_layer_pr_vgg
+        # 否则，使用针对ResNet的剪枝方法。
         else:
             get_layer_pr = self._get_layer_pr_resnet
 
+        # 初始化存储剪枝比例的字典。
         self.pr = {}
-        if self.args.stage_pr: # stage_pr may be None (in the case that base_pr_model is provided)
+
+        # 如果设置了阶段性剪枝参数，表示当前是剪枝过程中的一个阶段。
+        if self.args.stage_pr:  # 如果提供了基础剪枝模型，则stage_pr可能为None。
+            # 遍历模型的所有模块，并为卷积层和全连接层计算剪枝比例。
             for name, m in self.model.named_modules():
                 if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                    # 调用对应的剪枝方法来获取剪枝比例，并存储在字典中。
                     self.pr[name] = get_layer_pr(name)
+        # 如果没有设置阶段性剪枝参数，则需要加载提供的基础剪枝模型。
         else:
+            # 断言确保提供了基础剪枝模型的路径。
             assert self.args.base_pr_model
+            # 加载基础剪枝模型的状态。
             state = torch.load(self.args.base_pr_model)
+            # 获取并存储已剪枝和未剪枝权重组的信息。
             self.pruned_wg_pr_model = state['pruned_wg']
             self.kept_wg_pr_model = state['kept_wg']
+            # 计算并存储每层的剪枝比例。
             for k in self.pruned_wg_pr_model:
                 n_pruned = len(self.pruned_wg_pr_model[k])
                 n_kept = len(self.kept_wg_pr_model[k])
+                # 剪枝比例计算为已剪枝权重数量除以总权重数量。
                 self.pr[k] = float(n_pruned) / (n_pruned + n_kept)
+            # 输出日志信息，提示基础剪枝模型加载成功，并继承了其剪枝比例。
             self.logprint("==> Load base_pr_model successfully and inherit its pruning ratio: '{}'".format(self.args.base_pr_model))
 
     def _get_kept_wg_L1(self):
+        # 检查是否提供了基础剪枝模型，且继承方式为'index'。
         if self.args.base_pr_model and self.args.inherit_pruned == 'index':
+            # 如果是，直接继承基础剪枝模型中的剪枝和保留权重组。
             self.pruned_wg = self.pruned_wg_pr_model
             self.kept_wg = self.kept_wg_pr_model
+            # 记录日志信息，指出从基础剪枝模型继承了剪枝索引。
             self.logprint("==> Inherit the pruned index from base_pr_model: '{}'".format(self.args.base_pr_model))
-        else:    
+        else:
+            # 如果不继承或没有提供基础剪枝模型，根据权重组(wg)参数决定剪枝策略。
             wg = self.args.wg
+            # 遍历模型中的所有模块。
             for name, m in self.model.named_modules():
+                # 只对卷积层和全连接层进行操作。
                 if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                    # 获取权重的形状。
                     shape = m.weight.data.shape
+                    # 根据权重组参数计算每个权重的分数（基于L1范数）。
                     if wg == "filter":
                         score = m.weight.abs().mean(dim=[1, 2, 3]) if len(shape) == 4 else m.weight.abs().mean(dim=1)
                     elif wg == "channel":
@@ -273,69 +295,90 @@ class MetaPruner:
                     elif wg == "weight":
                         score = m.weight.abs().flatten()
                     else:
+                        # 如果wg参数不是这三种之一，抛出未实现错误。
                         raise NotImplementedError
+                    # 根据分数和剪枝比例确定哪些权重将被剪枝，并将其索引存储在self.pruned_wg中。
                     self.pruned_wg[name] = self._pick_pruned(score, self.pr[name], self.args.pick_pruned)
+                    # 计算并存储应该被保留的权重的索引。
                     self.kept_wg[name] = [i for i in range(len(score)) if i not in self.pruned_wg[name]]
+                    # 记录关于该层剪枝情况的日志信息。
                     logtmp = '[%2d %s] got pruned wg by L1 sorting (%s), pr %.4f' % (self.layers[name].layer_index, name, self.args.pick_pruned, self.pr[name])
                     
-                    # compare the pruned weights picked by L1-sorting vs. other criterion which provides the base_pr_model (e.g., OBD)
+                    # 如果提供了基础剪枝模型，比较基于L1排序选出的剪枝权重与基础模型中的剪枝权重的交集比例。
                     if self.args.base_pr_model:
                         intersection = [x for x in self.pruned_wg_pr_model[name] if x in self.pruned_wg[name]]
                         intersection_ratio = len(intersection) / len(self.pruned_wg[name]) if len(self.pruned_wg[name]) else 0
                         logtmp += ', intersection ratio of the weights picked by L1 vs. base_pr_model: %.4f (%d)' % (intersection_ratio, len(intersection))
+                    # 输出剪枝情况的详细日志。
                     self.netprint(logtmp)
 
     def _get_kept_filter_channel(self, m, name):
+        # 根据剪枝的策略是基于通道还是过滤器来决定保留的通道和过滤器
         if self.args.wg == "channel":
-            kept_chl = self.kept_wg[name]
-            next_conv = self._next_conv(self.model, name, m)
+            # 如果是基于通道的剪枝策略
+            kept_chl = self.kept_wg[name]  # 获取当前卷积层保留的通道索引
+            next_conv = self._next_conv(self.model, name, m)  # 找到当前卷积层的下一个卷积层
             if not next_conv:
-                kept_filter = range(m.weight.size(0))
+                # 如果没有下一个卷积层（即当前层是最后一个卷积层）
+                kept_filter = range(m.weight.size(0))  # 所有的过滤器都被保留
             else:
-                kept_filter = self.kept_wg[next_conv]
-        
+                # 如果有下一个卷积层
+                kept_filter = self.kept_wg[next_conv]  # 保留的过滤器索引与下一个卷积层保留的通道索引相同
+            
         elif self.args.wg == "filter":
-            kept_filter = self.kept_wg[name]
-            prev_conv = self._prev_conv(self.model, name, m)
+            # 如果是基于过滤器的剪枝策略
+            kept_filter = self.kept_wg[name]  # 获取当前卷积层保留的过滤器索引
+            prev_conv = self._prev_conv(self.model, name, m)  # 找到当前卷积层的前一个卷积层
             if not prev_conv:
-                kept_chl = range(m.weight.size(1))
+                # 如果没有前一个卷积层（即当前层是第一个卷积层）
+                kept_chl = range(m.weight.size(1))  # 所有的通道都被保留
             else:
-                kept_chl = self.kept_wg[prev_conv]
-        
-        return kept_filter, kept_chl
+                # 如果有前一个卷积层
+                kept_chl = self.kept_wg[prev_conv]  # 保留的通道索引与前一个卷积层保留的过滤器索引相同
+            
+        return kept_filter, kept_chl  # 返回保留的过滤器和通道的索引列表
+
+
 
     def _prune_and_build_new_model(self):
+        # 如果参数指定了权重组为'weight'，则仅获取掩码并返回
         if self.args.wg == 'weight':
             self._get_masks()
             return
 
+        # 深拷贝当前模型以构建新模型
         new_model = copy.deepcopy(self.model)
+        # 用于记录线性层的数量
         cnt_linear = 0
+        # 遍历当前模型的所有模块及其名称
         for name, m in self.model.named_modules():
+            # 如果模块是卷积层
             if isinstance(m, nn.Conv2d):
+                # 获取要保留的卷积核(filter)和通道
                 kept_filter, kept_chl = self._get_kept_filter_channel(m, name)
                 
-                # copy conv weight and bias
+                # 复制卷积层的权重和偏置
                 bias = False if isinstance(m.bias, type(None)) else True
                 kept_weights = m.weight.data[kept_filter][:, kept_chl, :, :]
                 new_conv = nn.Conv2d(kept_weights.size(1), kept_weights.size(0), m.kernel_size,
-                                  m.stride, m.padding, m.dilation, m.groups, bias).cuda()
-                new_conv.weight.data.copy_(kept_weights) # load weights into the new module
+                                m.stride, m.padding, m.dilation, m.groups, bias).cuda()
+                new_conv.weight.data.copy_(kept_weights)  # 将权重加载到新模块
                 if bias:
                     kept_bias = m.bias.data[kept_filter]
                     new_conv.bias.data.copy_(kept_bias)
                 
-                # load the new conv
+                # 加载新的卷积层
                 self._replace_module(new_model, name, new_conv)
 
-                # get the corresponding bn (if any) for later use
+                # 获取对应的批量归一化层（如果有的话）以供后用
                 next_bn = self._next_bn(self.model, m)
 
+            # 如果模块是批量归一化层，并且是紧接在卷积层之后的归一化层
             elif isinstance(m, nn.BatchNorm2d) and m == next_bn:
                 new_bn = nn.BatchNorm2d(len(kept_filter), eps=m.eps, momentum=m.momentum, 
                         affine=m.affine, track_running_stats=m.track_running_stats).cuda()
                 
-                # copy bn weight and bias
+                # 复制批量归一化层的权重和偏置
                 if self.args.copy_bn_w:
                     weight = m.weight.data[kept_filter]
                     new_bn.weight.data.copy_(weight)
@@ -343,18 +386,20 @@ class MetaPruner:
                     bias = m.bias.data[kept_filter]
                     new_bn.bias.data.copy_(bias)
                 
-                # copy bn running stats
+                # 复制批量归一化层的运行时统计数据
                 new_bn.running_mean.data.copy_(m.running_mean[kept_filter])
                 new_bn.running_var.data.copy_(m.running_var[kept_filter])
                 new_bn.num_batches_tracked.data.copy_(m.num_batches_tracked)
                 
-                # load the new bn
+                # 加载新的批量归一化层
                 self._replace_module(new_model, name, new_bn)
             
+            # 如果模块是全连接层
             elif isinstance(m, nn.Linear):
                 cnt_linear += 1
+                # 如果是第一个全连接层
                 if cnt_linear == 1:
-                    # get the last conv
+                    # 获取最后一个卷积层
                     last_conv = ''
                     last_conv_name = ''
                     for n, mm in self.model.named_modules():
@@ -363,29 +408,32 @@ class MetaPruner:
                             last_conv_name = n
                     kept_filter_last_conv, _ = self._get_kept_filter_channel(last_conv, last_conv_name)
                     
-                    # get kept weights
+                    # 获取要保持的权重
                     dim_in = m.weight.size(1)
-                    fm_size = int(dim_in / last_conv.weight.size(0)) # 36 for alexnet
+                    fm_size = int(dim_in / last_conv.weight.size(0))  # 例如对于alexnet是36
                     kept_dim_in = []
                     for i in kept_filter_last_conv:
                         tmp = list(range(i * fm_size, i * fm_size + fm_size))
                         kept_dim_in += tmp
                     kept_weights = m.weight.data[:, kept_dim_in]
                     
-                    # build the new linear layer
+                    # 构建新的全连接层
                     bias = False if isinstance(m.bias, type(None)) else True
                     new_linear = nn.Linear(in_features=len(kept_dim_in), out_features=m.out_features, bias=bias).cuda()
                     new_linear.weight.data.copy_(kept_weights)
                     if bias:
                         new_linear.bias.data.copy_(m.bias.data)
                     
-                    # load the new linear
+                    # 加载新的全连接层
                     self._replace_module(new_model, name, new_linear)
         
+        # 更新模型为剪枝后的新模型
         self.model = new_model
+        # 获取新模型中的过滤器数量
         n_filter = self._get_n_filter(self.model)
+        # 打印过滤器数量
         self.logprint(n_filter)
-    
+
     def _get_masks(self):
         '''Get masks for unstructured pruning
         '''
